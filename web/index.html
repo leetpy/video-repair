@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Video Restore 4K</title>
+    <title>视频修复</title>
     <link rel="stylesheet" href="/app.css" />
   </head>
   <body>
@@ -11,8 +11,8 @@
       <section class="workspace">
         <header class="mast">
           <div>
-            <p class="eyebrow">Local 4K restore</p>
-            <h1>把 AVI 修复成 4K MP4</h1>
+            <p class="eyebrow">Local video restore</p>
+            <h1>视频修复</h1>
           </div>
           <div class="tool-status" id="toolStatus">检查工具中</div>
         </header>
@@ -20,7 +20,7 @@
         <form id="jobForm" class="panel">
           <label class="dropzone" for="video">
             <input id="video" name="video" type="file" accept=".avi,video/*" required />
-            <span class="drop-icon">4K</span>
+            <span class="drop-icon">VR</span>
             <span class="drop-copy">
               <strong id="fileLabel">选择本地 AVI 视频</strong>
               <small>视频只在本机处理。输出默认保存在当前工作目录。</small>
@@ -44,13 +44,16 @@
               <span>模型</span>
               <select name="model" id="model">
                 <option value="realesrgan-x4plus">真实视频</option>
-                <option value="realesr-animevideov3">动漫视频</option>
+				<option value="realesr-animevideov3">轻量视频（偏动漫）</option>
                 <option value="realesrgan-x4plus-anime">动漫图片风格</option>
               </select>
             </label>
             <label>
               <span>处理模式</span>
               <select name="upscaleMode" id="upscaleMode">
+				<option value="turbo">极速 AI（轻量实验）</option>
+				<option value="fast">快速修复（最快，跳过 AI）</option>
+				<option value="efficient">AI 高画质（很慢）</option>
                 <option value="gtx1060">GTX 1060 快速</option>
                 <option value="quality">画质优先</option>
                 <option value="x2">固定 AI x2</option>
@@ -60,9 +63,9 @@
             <label>
               <span>目标分辨率</span>
               <select name="target" id="target">
-                <option value="4k">4K 3840×2160</option>
-                <option value="2k">2K 2560×1440</option>
-                <option value="1080p">1080p 1920×1080</option>
+				<option value="1080p">1080p 1920×1080</option>
+				<option value="4k">4K 3840×2160</option>
+				<option value="2k">2K 2560×1440</option>
                 <option value="ai">只保留 AI 输出</option>
               </select>
             </label>
@@ -70,6 +73,10 @@
               <span>Tile 显存控制</span>
               <input name="tileSize" id="tileSize" type="number" min="0" step="32" value="64" />
             </label>
+			<label>
+			  <span>预览帧数</span>
+			  <input name="previewFrames" id="previewFrames" type="number" min="1" step="1" value="20" />
+			</label>
             <label class="wide">
               <span>输出目录</span>
               <input name="outputFolder" id="outputFolder" placeholder="留空则保存到程序当前目录" />
@@ -83,6 +90,7 @@
 
           <div class="actions">
             <button type="submit" id="startBtn">开始修复</button>
+			<button type="button" id="previewBtn">预览前 20 帧</button>
             <button type="button" id="cancelBtn" disabled>取消</button>
           </div>
         </form>
@@ -94,6 +102,10 @@
           </div>
           <div class="meter"><span id="meterBar"></span></div>
           <p id="resultText" class="result"></p>
+		  <div id="previewArea" class="preview-area" hidden>
+			<p id="previewTitle">修复预览 · 前 20 帧</p>
+			<video id="previewPlayer" controls playsinline preload="metadata"></video>
+		  </div>
         </section>
       </section>
 

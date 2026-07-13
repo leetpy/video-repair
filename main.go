@@ -27,6 +27,8 @@ import (
 //go:embed web/*
 var webFS embed.FS
 
+const defaultPreviewFrameCount = 20
+
 type app struct {
 	mu   sync.Mutex
 	jobs map[string]*job
@@ -49,18 +51,20 @@ type job struct {
 }
 
 type processOptions struct {
-	FFmpegPath   string
-	FFprobePath  string
-	RealESRGAN   string
-	ModelPath    string
-	Model        string
-	UpscaleMode  string
-	Target       string
-	TileSize     int
-	QueueMode    string
-	Denoise      bool
-	Deinterlace  bool
-	OutputFolder string
+	FFmpegPath    string
+	FFprobePath   string
+	RealESRGAN    string
+	ModelPath     string
+	Model         string
+	UpscaleMode   string
+	Target        string
+	TileSize      int
+	QueueMode     string
+	Denoise       bool
+	Deinterlace   bool
+	OutputFolder  string
+	Preview       bool
+	PreviewFrames int
 }
 
 type probeInfo struct {
@@ -79,6 +83,15 @@ type probeInfo struct {
 type progressSample struct {
 	frames   int
 	duration time.Duration
+}
+
+type encodingRequest struct {
+	inputArgs  []string
+	mapArgs    []string
+	filters    []string
+	outputPath string
+	frameLimit int
+	shortest   bool
 }
 
 func main() {
@@ -227,6 +240,10 @@ func (a *app) handleJob(w http.ResponseWriter, r *http.Request) {
 		a.handleCancel(w, r, strings.TrimSuffix(path, "/cancel"))
 		return
 	}
+	if strings.HasSuffix(path, "/output") {
+		a.handleJobOutput(w, r, strings.TrimSuffix(path, "/output"))
+		return
+	}
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -237,6 +254,24 @@ func (a *app) handleJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, j)
+}
+
+func (a *app) handleJobOutput(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	j := a.getJob(id)
+	if j == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if j.Status != "done" || j.OutputPath == "" {
+		http.Error(w, "output is not ready", http.StatusConflict)
+		return
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", filepath.Base(j.OutputPath)))
+	http.ServeFile(w, r, j.OutputPath)
 }
 
 func (a *app) handleEvents(w http.ResponseWriter, r *http.Request, id string) {
@@ -299,7 +334,8 @@ func (a *app) process(ctx context.Context, j *job, inputPath string, opts proces
 			a.fail(j.ID, fmt.Errorf("panic: %v", r))
 		}
 	}()
-	if err := validateTools(opts); err != nil {
+	useAI := opts.UpscaleMode != "fast"
+	if err := validateTools(opts, useAI); err != nil {
 		a.fail(j.ID, err)
 		return
 	}
@@ -317,7 +353,26 @@ func (a *app) process(ctx context.Context, j *job, inputPath string, opts proces
 	}
 	scale := upscaleScale(width, height, opts.UpscaleMode)
 	targetWidth, targetHeight := targetSize(opts.Target)
-	a.log(j.ID, fmt.Sprintf("Detected %dx%d at %s fps; Real-ESRGAN scale x%d; target %s", width, height, fps, scale, targetLabel(opts.Target)))
+	a.log(j.ID, fmt.Sprintf("Detected %dx%d at %s fps; target %s", width, height, fps, targetLabel(opts.Target)))
+	model := opts.Model
+	queueMode := opts.QueueMode
+	if opts.UpscaleMode == "turbo" {
+		model = "realesr-animevideov3"
+		queueMode = "balanced"
+		a.log(j.ID, "Turbo AI uses the lightweight x2 video model; real-scene texture may be less accurate")
+	}
+
+	outputPath, err := prepareOutputPath(inputPath, j.FileName, opts)
+	if err != nil {
+		a.fail(j.ID, err)
+		return
+	}
+	if !useAI {
+		a.processFast(ctx, j, inputPath, outputPath, opts, targetWidth, targetHeight)
+		return
+	}
+
+	a.log(j.ID, fmt.Sprintf("Real-ESRGAN scale x%d", scale))
 
 	framesDir := filepath.Join(j.dir, "frames")
 	upscaledDir := filepath.Join(j.dir, "upscaled")
@@ -330,7 +385,11 @@ func (a *app) process(ctx context.Context, j *job, inputPath string, opts proces
 		return
 	}
 
-	a.step(j.ID, "extract", 12, "Extracting frames from AVI")
+	extractMessage := "Extracting video frames"
+	if opts.Preview {
+		extractMessage = fmt.Sprintf("Extracting first %d frames for preview", opts.PreviewFrames)
+	}
+	a.step(j.ID, "extract", 12, extractMessage)
 	filters := make([]string, 0, 2)
 	if opts.Deinterlace {
 		filters = append(filters, "yadif")
@@ -338,11 +397,34 @@ func (a *app) process(ctx context.Context, j *job, inputPath string, opts proces
 	if opts.Denoise {
 		filters = append(filters, "hqdn3d=1.5:1.5:6:6")
 	}
+	if opts.UpscaleMode == "efficient" || opts.UpscaleMode == "turbo" {
+		inputWidth, inputHeight := efficientInputSize(
+			width,
+			height,
+			targetWidth,
+			targetHeight,
+			scale,
+		)
+		if inputWidth != width || inputHeight != height {
+			filters = append(filters, fmt.Sprintf("scale=%d:%d", inputWidth, inputHeight))
+			a.log(j.ID, fmt.Sprintf(
+				"Efficient AI input: %dx%d -> %dx%d",
+				width,
+				height,
+				inputWidth,
+				inputHeight,
+			))
+		}
+	}
 	args := []string{"-hide_banner", "-y", "-i", inputPath, "-map", "0:v:0"}
 	if len(filters) > 0 {
 		args = append(args, "-vf", strings.Join(filters, ","))
 	}
-	args = append(args, "-vsync", "0", filepath.Join(framesDir, "%08d.png"))
+	args = append(args, "-vsync", "0")
+	if opts.Preview {
+		args = append(args, "-frames:v", strconv.Itoa(opts.PreviewFrames))
+	}
+	args = append(args, filepath.Join(framesDir, "%08d.png"))
 	if err := a.run(ctx, j.ID, opts.FFmpegPath, args...); err != nil {
 		a.fail(j.ID, err)
 		return
@@ -363,14 +445,14 @@ func (a *app) process(ctx context.Context, j *job, inputPath string, opts proces
 		"-i", framesDir,
 		"-o", upscaledDir,
 		"-m", modelPathForExecutable(opts.RealESRGAN, opts.ModelPath),
-		"-n", opts.Model,
+		"-n", model,
 		"-s", strconv.Itoa(scale),
 		"-f", "png",
 	}
 	if opts.TileSize > 0 {
 		args = append(args, "-t", strconv.Itoa(opts.TileSize))
 	}
-	if queue := queueSetting(opts.QueueMode); queue != "" {
+	if queue := queueSetting(queueMode); queue != "" {
 		args = append(args, "-j", queue)
 	}
 	monitorDone := make(chan struct{})
@@ -386,47 +468,18 @@ func (a *app) process(ctx context.Context, j *job, inputPath string, opts proces
 		j.Message = "Upscaled all frames"
 	})
 
-	outputDir := opts.OutputFolder
-	if outputDir == "" {
-		outputDir = filepath.Dir(inputPath)
-	}
-	if outputDir == filepath.Dir(inputPath) {
-		cwd, err := os.Getwd()
-		if err == nil {
-			outputDir = cwd
-		}
-	}
-	if err := os.MkdirAll(outputDir, 0o755); err != nil {
-		a.fail(j.ID, err)
-		return
-	}
-	outputName := strings.TrimSuffix(filepath.Base(j.FileName), filepath.Ext(j.FileName)) + "_" + outputSuffix(opts.Target) + ".mp4"
-	outputPath := filepath.Join(outputDir, outputName)
-
 	a.step(j.ID, "encode", 78, "Encoding MP4 with original audio")
 	framePattern := filepath.Join(upscaledDir, "%08d.png")
-	args = []string{"-hide_banner", "-y", "-framerate", fps, "-i", framePattern, "-i", inputPath}
 	videoFilters := []string{"setsar=1"}
-	if targetWidth > 0 && targetHeight > 0 {
-		videoFilters = append(videoFilters,
-			fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease", targetWidth, targetHeight),
-			fmt.Sprintf("pad=%d:%d:(ow-iw)/2:(oh-ih)/2", targetWidth, targetHeight),
-		)
+	videoFilters = appendTargetFilters(videoFilters, targetWidth, targetHeight)
+	request := encodingRequest{
+		inputArgs:  []string{"-framerate", fps, "-i", framePattern, "-i", inputPath},
+		mapArgs:    []string{"-map", "0:v:0", "-map", "1:a?"},
+		filters:    videoFilters,
+		outputPath: outputPath,
+		shortest:   opts.Preview,
 	}
-	args = append(args,
-		"-map", "0:v:0",
-		"-map", "1:a?",
-		"-vf", strings.Join(videoFilters, ","),
-		"-c:v", "libx264",
-		"-pix_fmt", "yuv420p",
-		"-crf", "18",
-		"-preset", "slow",
-		"-c:a", "aac",
-		"-b:a", "192k",
-		"-movflags", "+faststart",
-		outputPath,
-	)
-	if err := a.run(ctx, j.ID, opts.FFmpegPath, args...); err != nil {
+	if err := a.encodeWithFallback(ctx, j.ID, opts.FFmpegPath, request); err != nil {
 		a.fail(j.ID, err)
 		return
 	}
@@ -438,6 +491,128 @@ func (a *app) process(ctx context.Context, j *job, inputPath string, opts proces
 		j.Message = "Finished"
 		j.OutputPath = outputPath
 	})
+}
+
+func (a *app) processFast(
+	ctx context.Context,
+	j *job,
+	inputPath string,
+	outputPath string,
+	opts processOptions,
+	targetWidth int,
+	targetHeight int,
+) {
+	a.step(j.ID, "encode", 20, "Fast repair without AI upscaling")
+	filters := make([]string, 0, 5)
+	if opts.Deinterlace {
+		filters = append(filters, "yadif")
+	}
+	if opts.Denoise {
+		filters = append(filters, "hqdn3d=1.5:1.5:6:6")
+	}
+	filters = append(filters, "unsharp=5:5:0.5:5:5:0.0")
+	filters = appendTargetFilters(filters, targetWidth, targetHeight)
+	filters = append(filters, "setsar=1")
+	request := encodingRequest{
+		inputArgs:  []string{"-i", inputPath},
+		mapArgs:    []string{"-map", "0:v:0", "-map", "0:a?"},
+		filters:    filters,
+		outputPath: outputPath,
+		frameLimit: previewLimit(opts),
+		shortest:   opts.Preview,
+	}
+	if err := a.encodeWithFallback(ctx, j.ID, opts.FFmpegPath, request); err != nil {
+		a.fail(j.ID, err)
+		return
+	}
+	a.update(j.ID, func(j *job) {
+		j.Status = "done"
+		j.Stage = "done"
+		j.Progress = 100
+		j.Message = "Finished"
+		j.OutputPath = outputPath
+	})
+}
+
+func (a *app) encodeWithFallback(
+	ctx context.Context,
+	id string,
+	ffmpeg string,
+	request encodingRequest,
+) error {
+	encoder := availableHardwareEncoder(ctx, ffmpeg)
+	if encoder != "" {
+		a.log(id, "Using Windows hardware encoder: "+encoder)
+		args := encodingArgs(request, encoder)
+		if err := a.run(ctx, id, ffmpeg, args...); err == nil {
+			return nil
+		} else if errors.Is(ctx.Err(), context.Canceled) {
+			return err
+		}
+		a.log(id, "Hardware encoding failed; retrying with CPU encoder")
+	}
+
+	a.log(id, "Using CPU encoder: libx264 preset medium")
+	args := encodingArgs(request, "libx264")
+	if err := a.run(ctx, id, ffmpeg, args...); err != nil {
+		return fmt.Errorf("encoding video: %w", err)
+	}
+	return nil
+}
+
+func encodingArgs(request encodingRequest, encoder string) []string {
+	args := []string{"-hide_banner", "-y"}
+	args = append(args, request.inputArgs...)
+	args = append(args, request.mapArgs...)
+	if len(request.filters) > 0 {
+		args = append(args, "-vf", strings.Join(request.filters, ","))
+	}
+	args = append(args, encoderArgs(encoder)...)
+	if request.frameLimit > 0 {
+		args = append(args, "-frames:v", strconv.Itoa(request.frameLimit))
+	}
+	if request.shortest {
+		args = append(args, "-shortest")
+	}
+	args = append(args,
+		"-pix_fmt", "yuv420p",
+		"-c:a", "aac",
+		"-b:a", "192k",
+		"-movflags", "+faststart",
+		request.outputPath,
+	)
+	return args
+}
+
+func encoderArgs(encoder string) []string {
+	switch encoder {
+	case "h264_nvenc":
+		return []string{"-c:v", encoder, "-preset", "p4", "-cq", "19", "-b:v", "0"}
+	case "h264_qsv":
+		return []string{"-c:v", encoder, "-preset", "medium", "-global_quality", "19"}
+	case "h264_amf":
+		return []string{"-c:v", encoder, "-quality", "balanced", "-rc", "cqp", "-qp_i", "18", "-qp_p", "20"}
+	default:
+		return []string{"-c:v", "libx264", "-crf", "18", "-preset", "medium"}
+	}
+}
+
+func availableHardwareEncoder(ctx context.Context, ffmpeg string) string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	cmd := exec.CommandContext(ctx, ffmpeg, "-hide_banner", "-encoders")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	encoders := string(output)
+	for _, encoder := range []string{"h264_nvenc", "h264_qsv", "h264_amf"} {
+		if strings.Contains(encoders, encoder) {
+			return encoder
+		}
+	}
+	return ""
 }
 
 func (a *app) run(ctx context.Context, id, name string, args ...string) error {
@@ -592,17 +767,18 @@ func (a *app) update(id string, fn func(*job)) {
 
 func defaultOptions() processOptions {
 	return processOptions{
-		FFmpegPath:  firstNonEmpty(lookup("ffmpeg"), "ffmpeg"),
-		FFprobePath: firstNonEmpty(lookup("ffprobe"), "ffprobe"),
-		RealESRGAN:  firstNonEmpty(localTool("realesrgan-ncnn-vulkan"), "realesrgan-ncnn-vulkan"),
-		ModelPath:   localModelPath(),
-		Model:       "realesrgan-x4plus",
-		UpscaleMode: "gtx1060",
-		Target:      "4k",
-		TileSize:    64,
-		QueueMode:   "safe",
-		Denoise:     true,
-		Deinterlace: true,
+		FFmpegPath:    firstNonEmpty(lookup("ffmpeg"), "ffmpeg"),
+		FFprobePath:   firstNonEmpty(lookup("ffprobe"), "ffprobe"),
+		RealESRGAN:    firstNonEmpty(localTool("realesrgan-ncnn-vulkan"), "realesrgan-ncnn-vulkan"),
+		ModelPath:     localModelPath(),
+		Model:         "realesrgan-x4plus",
+		UpscaleMode:   "turbo",
+		Target:        "1080p",
+		TileSize:      64,
+		QueueMode:     "safe",
+		Denoise:       true,
+		Deinterlace:   true,
+		PreviewFrames: defaultPreviewFrameCount,
 	}
 }
 
@@ -647,15 +823,31 @@ func setOption(opts *processOptions, key, value string) {
 		opts.Denoise = value == "true"
 	case "deinterlace":
 		opts.Deinterlace = value == "true"
+	case "preview":
+		opts.Preview = value == "true"
+	case "previewFrames":
+		if frames, err := strconv.Atoi(value); err == nil && frames > 0 {
+			opts.PreviewFrames = frames
+		}
 	}
 }
 
-func validateTools(opts processOptions) error {
-	for label, path := range map[string]string{
-		"ffmpeg":      opts.FFmpegPath,
-		"ffprobe":     opts.FFprobePath,
-		"Real-ESRGAN": opts.RealESRGAN,
-	} {
+func validateTools(opts processOptions, useAI bool) error {
+	tools := []struct {
+		label string
+		path  string
+	}{
+		{label: "ffmpeg", path: opts.FFmpegPath},
+		{label: "ffprobe", path: opts.FFprobePath},
+	}
+	if useAI {
+		tools = append(tools, struct {
+			label string
+			path  string
+		}{label: "Real-ESRGAN", path: opts.RealESRGAN})
+	}
+	for _, tool := range tools {
+		label, path := tool.label, tool.path
 		if path == "" {
 			return fmt.Errorf("%s path is empty", label)
 		}
@@ -728,11 +920,70 @@ func upscaleScale(width, height int, mode string) int {
 		return chooseScale(width, height)
 	case "x4":
 		return 4
-	case "x2", "gtx1060":
+	case "x2", "gtx1060", "efficient", "turbo":
 		return 2
+	case "fast":
+		return 1
 	default:
 		return 2
 	}
+}
+
+func efficientInputSize(width, height, targetWidth, targetHeight, scale int) (int, int) {
+	if targetWidth <= 0 || targetHeight <= 0 || scale <= 0 {
+		return width, height
+	}
+	maxWidth := targetWidth / scale
+	maxHeight := targetHeight / scale
+	if width <= maxWidth && height <= maxHeight {
+		return width, height
+	}
+	ratio := min(float64(maxWidth)/float64(width), float64(maxHeight)/float64(height))
+	newWidth := max(2, int(float64(width)*ratio)/2*2)
+	newHeight := max(2, int(float64(height)*ratio)/2*2)
+	return newWidth, newHeight
+}
+
+func appendTargetFilters(filters []string, width, height int) []string {
+	if width <= 0 || height <= 0 {
+		return filters
+	}
+	return append(
+		filters,
+		fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease", width, height),
+		fmt.Sprintf("pad=%d:%d:(ow-iw)/2:(oh-ih)/2", width, height),
+	)
+}
+
+func prepareOutputPath(inputPath, fileName string, opts processOptions) (string, error) {
+	outputDir := opts.OutputFolder
+	if outputDir == "" {
+		outputDir = filepath.Dir(inputPath)
+	}
+	if outputDir == filepath.Dir(inputPath) {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("getting output directory: %w", err)
+		}
+		outputDir = cwd
+	}
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return "", fmt.Errorf("creating output directory: %w", err)
+	}
+	baseName := strings.TrimSuffix(filepath.Base(fileName), filepath.Ext(fileName))
+	suffix := outputSuffix(opts.Target)
+	if opts.Preview {
+		suffix += fmt.Sprintf("_preview_%df", opts.PreviewFrames)
+	}
+	outputName := baseName + "_" + suffix + ".mp4"
+	return filepath.Join(outputDir, outputName), nil
+}
+
+func previewLimit(opts processOptions) int {
+	if opts.Preview {
+		return opts.PreviewFrames
+	}
+	return 0
 }
 
 func targetSize(target string) (int, int) {

@@ -269,6 +269,27 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+.preview-area {
+	margin-top: 14px;
+	border-top: 1px solid var(--line);
+	padding-top: 14px;
+}
+
+.preview-area p {
+	margin: 0 0 10px;
+	color: var(--muted);
+	font-family: "SFMono-Regular", Consolas, monospace;
+	font-size: 12px;
+}
+
+.preview-area video {
+	display: block;
+	width: 100%;
+	max-height: 360px;
+	border-radius: 6px;
+	background: var(--console);
+}
+
 .console {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
